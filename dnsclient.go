@@ -6,10 +6,24 @@ import (
 	"log"
 	"net"
 	"os"
+	"regexp"
 	"strings"
+	"time"
+
+	"math/rand"
 
 	"github.com/urfave/cli/v2"
 )
+
+const RECORD_TYPE_A = 1
+const RECORD_TYPE_NS = 2
+const RECORD_TYPE_CNAME = 5
+const RECORD_TYPE_SOA = 6
+const RECORD_TYPE_PTR = 12
+const RECORD_TYPE_MX = 15
+const RECORD_TYPE_TXT = 16
+const RECORD_TYPE_AAAA = 28
+const RECORD_TYPE_SRV = 33
 
 type DnsHeader struct {
 	Id      uint16
@@ -30,9 +44,10 @@ type DnsResourceRecord struct {
 	Name     string
 	Type     uint16
 	Class    uint16
-	Ttl      uint16
+	Ttl      uint32
 	RdLength uint16
-	Rdata    string
+	Rdata    []byte // 4 bytes for IPv4 address
+	Rendered string // Human readable representation of the Rdata
 }
 
 type DnsMessage struct {
@@ -99,34 +114,271 @@ func encodeMessage(msg DnsMessage) []byte {
 
 func debugPrintBytes(bytes []byte, max int) {
 	g := 0
+	nn := 0
 	for i, b := range bytes {
 		fmt.Printf("%02x", b)
 		g++
+		nn++
 		if g == max {
 			break
 		}
 		if (i+1)%2 == 0 {
 			fmt.Print(" ")
 		}
+		if nn == 16 {
+			fmt.Println("")
+			nn = 0
+		}
 	}
 	fmt.Println("")
+}
+
+func generateRandomId() uint16 {
+	// Generate a random uint16
+	random16 := rand.Intn(65535)
+	return uint16(random16)
+}
+
+// Lookup a Qname label in byte array starting and index start
+// Return the label and the new index
+// If it's a compressed label, we recursively call this function to grab the label elsewhere
+func getLabel(start int, fullbytes []byte) (string, int) {
+	b := start
+	label := string("")
+	chunk := ""
+	for {
+		if fullbytes[b] == 0x00 {
+			b++
+			break
+		}
+		labelStart := fullbytes[b]
+		if (labelStart & 0b11000000) == 0b11000000 {
+			// Compressed portion
+			labelOffset := uint16(labelStart&0b00111111)<<8 | uint16(fullbytes[b+1])
+			// basically a 14-bit number pointing to the actual chunk
+			chunk, _ = getLabel(int(labelOffset), fullbytes)
+			label += string(chunk)
+			b += 2 // jump past the 2 bytes pointer and just return
+			return label, b
+		} else {
+			length := int(labelStart)
+			chunk = string(fullbytes[b+1 : b+1+length])
+			b += length + 1
+			label += string(chunk) + "."
+		}
+	}
+	return label, b
+}
+
+// Convert the Rdata bytes into a human-readable format
+// Usually an IPv4 address, but could be many other things
+// We need to pass in the full bytes also, to handle compressed labels pointing to the actual domain name
+func getRdataHumanDisplay(bytes []byte, fullbytes []byte, recType uint16, rDataStart int) string {
+	if recType == RECORD_TYPE_A {
+		return fmt.Sprintf("%d.%d.%d.%d", bytes[0], bytes[1], bytes[2], bytes[3])
+	}
+	if recType == RECORD_TYPE_MX {
+		pref := uint16(bytes[0])<<8 | uint16(bytes[1])
+		label, _ := getLabel(rDataStart+2, fullbytes)
+		return fmt.Sprintf("%d %s", pref, label)
+	}
+	if recType == RECORD_TYPE_NS || recType == RECORD_TYPE_CNAME || recType == RECORD_TYPE_PTR {
+		label, _ := getLabel(rDataStart, fullbytes)
+		return label
+	}
+	// Unknown, return hex representation
+	return fmt.Sprintf("%x", bytes)
+}
+
+func recordIntToType(recInt uint16) string {
+	switch recInt {
+	case RECORD_TYPE_A:
+		return "A"
+	case RECORD_TYPE_NS:
+		return "NS"
+	case RECORD_TYPE_CNAME:
+		return "CNAME"
+	case RECORD_TYPE_SOA:
+		return "SOA"
+	case RECORD_TYPE_PTR:
+		return "PTR"
+	case RECORD_TYPE_MX:
+		return "MX"
+	case RECORD_TYPE_TXT:
+		return "TXT"
+	case RECORD_TYPE_AAAA:
+		return "AAAA"
+	case RECORD_TYPE_SRV:
+		return "SRV"
+	default:
+		return "nil"
+	}
+}
+
+func recordTypeToInt(recType string) uint16 {
+	switch recType {
+	case "A":
+		return RECORD_TYPE_A
+	case "NS":
+		return RECORD_TYPE_NS
+	case "CNAME":
+		return RECORD_TYPE_CNAME
+	case "SOA":
+		return RECORD_TYPE_SOA
+	case "PTR":
+		return RECORD_TYPE_PTR
+	case "MX":
+		return RECORD_TYPE_MX
+	case "TXT":
+		return RECORD_TYPE_TXT
+	case "AAAA":
+		return RECORD_TYPE_AAAA
+	case "SRV":
+		return RECORD_TYPE_SRV
+	default:
+		return 0
+	}
+}
+
+func decodeDnsResponse(bytes []byte) DnsMessage {
+	// Decode the DNS response
+	// The first 12 bytes are the header
+	header := DnsHeader{
+		Id:      uint16(bytes[0])<<8 | uint16(bytes[1]),
+		Flags:   uint16(bytes[2])<<8 | uint16(bytes[3]),
+		QuCount: uint16(bytes[4])<<8 | uint16(bytes[5]),
+		AnCount: uint16(bytes[6])<<8 | uint16(bytes[7]),
+		AuCount: uint16(bytes[8])<<8 | uint16(bytes[9]),
+		AdCount: uint16(bytes[10])<<8 | uint16(bytes[11]),
+	}
+
+	fmt.Println("-----------------------------------------------------------------")
+	fmt.Println("Header Section:")
+	fmt.Printf("XID=%x\tFlags=%x\tQuestion=%d\tAnswers=%d\tAuthority=%d\tAdditional=%d\n", header.Id, header.Flags, header.QuCount, header.AnCount, header.AuCount, header.AdCount)
+	fmt.Println("-----------------------------------------------------------------")
+
+	domainName, b := getLabel(12, bytes)
+
+	question := DnsQuestion{
+		Qname:  domainName,
+		Qclass: uint16(bytes[b])<<8 | uint16(bytes[b+1]),
+		Qtype:  uint16(bytes[b+2])<<8 | uint16(bytes[b+3]),
+	}
+	b += 4
+
+	fmt.Println("Question Section:")
+	fmt.Printf("QNAME=%s\tQCLASS=%x\tQTYPE=%x\n", question.Qname, question.Qclass, question.Qtype)
+	fmt.Println("-----------------------------------------------------------------")
+
+	answers := make([]DnsResourceRecord, header.AnCount)
+
+	for i := 0; i < int(header.AnCount); i++ {
+		label, newOffset := getLabel(b, bytes)
+		b = newOffset
+		answers[i].Name = label
+		answers[i].Type = uint16(bytes[b])<<8 | uint16(bytes[b+1])
+		answers[i].Class = uint16(bytes[b+2])<<8 | uint16(bytes[b+3])
+		answers[i].Ttl = uint32(bytes[b+4])<<24 | uint32(bytes[b+5])<<16 | uint32(bytes[b+6])<<8 | uint32(bytes[b+7])
+		answers[i].RdLength = uint16(bytes[b+8])<<8 | uint16(bytes[b+9])
+		b += 10
+		answers[i].Rdata = bytes[b : b+int(answers[i].RdLength)]
+		answers[i].Rendered = getRdataHumanDisplay(answers[i].Rdata, bytes, answers[i].Type, b)
+		b += int(answers[i].RdLength)
+	}
+
+	fmt.Println("Answer Section:")
+
+	for _, answer := range answers {
+		fmt.Printf("%s\t%d\t%x\t%s\t%s\n", answer.Name, answer.Ttl, answer.Class, recordIntToType(answer.Type), answer.Rendered)
+	}
+	fmt.Println("-----------------------------------------------------------------")
+
+	// Print current date and time
+	fmt.Printf("WHEN (Local):\t%s\n", time.Now().Format(time.RFC3339Nano))
+	utcTime := time.Now().UTC()
+	fmt.Printf("WHEN (UTC):\t%s\n", utcTime.Format(time.RFC3339Nano))
+
+	return DnsMessage{}
+}
+
+// Rudimentary function to check if a domain name is valid (probably does not catch every case)
+func isValidDomain(domain string) bool {
+	if len(domain) > 255 {
+		return false
+	}
+	if domain == "" {
+		return false
+	}
+	var domainRegex = regexp.MustCompile(`^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$`)
+	return domainRegex.MatchString(domain)
+}
+
+func getDnsServer(c *cli.Context) string {
+	dnsServer := c.String("dns-server")
+	if dnsServer == "" {
+		// TODO: read from system DNS settings if blank
+		dnsServer = "8.8.8.8" // use Google's public DNS
+	}
+	return dnsServer
 }
 
 func main() {
 	app := &cli.App{
 		Name:  "dnsclient",
 		Usage: "Query DNS records",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:  "debug",
+				Usage: "Enable debug mode, prints raw bytes",
+				Value: false,
+			},
+			&cli.StringFlag{
+				Name:  "dns-server",
+				Usage: "DNS server to query",
+				Value: "",
+			},
+			&cli.StringFlag{
+				Name:  "domain",
+				Usage: "Domain name to query",
+			},
+			&cli.StringFlag{
+				Name:  "port",
+				Usage: "Port to use for DNS query",
+				Value: "53",
+			},
+			&cli.StringFlag{
+				Name:  "type",
+				Usage: "Type of DNS record to query",
+				Value: "A",
+			},
+		},
 		Action: func(c *cli.Context) error {
+			// TODO: Handle case where response is larger than 512 bytes
 			p := make([]byte, 512)
-			fmt.Println("Running UDP Dial")
-			conn, err := net.Dial("udp", "8.8.8.8:53")
+			debugMode := c.Bool("debug")
+			domain := c.String("domain")
+			// Exit if the domain contains invalid characters
+			if !isValidDomain(domain) {
+				err := fmt.Errorf("ERROR: Invalid domain name: \"%s\"", domain)
+				cli.ShowAppHelp(c)
+				// Help text gets printed to STDOUT
+				// Error text gets printed to STDERR
+				return err
+			}
+			recordType := recordTypeToInt(c.String("type"))
+			if recordType == 0 {
+				err := fmt.Errorf("ERROR: Invalid record type: \"%s\"", c.String("type"))
+				cli.ShowAppHelp(c)
+				return err
+			}
+			dnsServer := getDnsServer(c)
+			conn, err := net.Dial("udp", dnsServer+":"+c.String("port"))
 			if err != nil {
 				return err
 			}
-			fmt.Println("Writing data to conn")
 			// Send DNS query to the server
 			header := DnsHeader{
-				Id:      0xABAB,
+				Id:      generateRandomId(),
 				Flags:   0x0100,
 				QuCount: 0x0001,
 				AnCount: 0x0000,
@@ -134,9 +386,9 @@ func main() {
 				AdCount: 0x0000,
 			}
 			question := DnsQuestion{
-				Qname:  "example.com",
-				Qclass: 0x0001, // QCLASS=IN
-				Qtype:  0x0001, // QTYPE=A
+				Qname:  domain,
+				Qclass: 0x0001,     // QCLASS=IN
+				Qtype:  recordType, // QTYPE=A
 			}
 			msg := DnsMessage{
 				Header:   header,
@@ -144,24 +396,34 @@ func main() {
 			}
 			bytes := encodeMessage(msg)
 
-			fmt.Println("Encoded msg:")
-			debugPrintBytes(bytes, 128)
+			if debugMode {
+				fmt.Println("Encoded msg:")
+				debugPrintBytes(bytes, 128)
+			}
 
 			_, err = conn.Write(bytes)
 			if err != nil {
 				return err
 			}
-			fmt.Println("Reading response:")
+
+			if debugMode {
+				fmt.Println("Wrote to DNS server:", dnsServer+":"+c.String("port"))
+			}
+
 			_, err = bufio.NewReader(conn).Read(p)
-			fmt.Println("Printing the result as raw hexadecimal:")
 			if err != nil {
+				if debugMode {
+					fmt.Println("Error reading from DNS server.")
+				}
 				return err
-			} else {
-				// Print p in hexadecimal
+			} else if debugMode {
 				debugPrintBytes(p, 200)
 				fmt.Println("")
 			}
 			conn.Close()
+
+			decodeDnsResponse(p)
+
 			return nil
 		},
 	}
