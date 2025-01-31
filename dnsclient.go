@@ -77,7 +77,7 @@ func encodeQname(qname string) []byte {
 }
 
 func encodeMessage(msg DnsMessage) []byte {
-	bytes := make([]byte, 2048)
+	bytes := make([]byte, 512)
 	bytes[0] = byte(msg.Header.Id >> 8)
 	bytes[1] = byte(msg.Header.Id)
 	bytes[2] = byte(msg.Header.Flags >> 8)
@@ -178,13 +178,23 @@ func getRdataHumanDisplay(bytes []byte, fullbytes []byte, recType uint16, rDataS
 		return fmt.Sprintf("%d.%d.%d.%d", bytes[0], bytes[1], bytes[2], bytes[3])
 	}
 	if recType == RECORD_TYPE_MX {
-		pref := uint16(bytes[0])<<8 | uint16(bytes[1])
+		pref := grabUint16(bytes, 0)
 		label, _ := getLabel(rDataStart+2, fullbytes)
 		return fmt.Sprintf("%d %s", pref, label)
 	}
 	if recType == RECORD_TYPE_NS || recType == RECORD_TYPE_CNAME || recType == RECORD_TYPE_PTR {
 		label, _ := getLabel(rDataStart, fullbytes)
 		return label
+	}
+	if recType == RECORD_TYPE_SOA {
+		mName, offset1 := getLabel(rDataStart, fullbytes)
+		rName, nextOffset := getLabel(offset1, fullbytes)
+		serial := grabUint32(fullbytes, nextOffset)
+		refresh := grabUint32(fullbytes, nextOffset+4)
+		retry := grabUint32(fullbytes, nextOffset+8)
+		expire := grabUint32(fullbytes, nextOffset+12)
+		minimum := grabUint32(fullbytes, nextOffset+16)
+		return fmt.Sprintf("%s %s %d %d %d %d %d", mName, rName, serial, refresh, retry, expire, minimum)
 	}
 	// Unknown, return hex representation
 	return fmt.Sprintf("%x", bytes)
@@ -211,7 +221,8 @@ func recordIntToType(recInt uint16) string {
 	case RECORD_TYPE_SRV:
 		return "SRV"
 	default:
-		return "nil"
+		// Return decimal representation for unknown
+		return fmt.Sprintf("%d", recInt)
 	}
 }
 
@@ -240,16 +251,60 @@ func recordTypeToInt(recType string) uint16 {
 	}
 }
 
+// Helper function to grab a uint32 from a byte array
+func grabUint32(bytes []byte, start int) uint32 {
+	return uint32(bytes[start])<<24 | uint32(bytes[start+1])<<16 | uint32(bytes[start+2])<<8 | uint32(bytes[start+3])
+}
+
+// Helper function to grab a uint16 from a byte array
+func grabUint16(bytes []byte, start int) uint16 {
+	return uint16(bytes[start])<<8 | uint16(bytes[start+1])
+}
+
+func buildResourceRecords(bytes []byte, start int, count int) ([]DnsResourceRecord, int) {
+	answers := make([]DnsResourceRecord, count)
+	b := start
+	for i := 0; i < int(count); i++ {
+		label, newOffset := getLabel(b, bytes)
+		b = newOffset
+		answers[i].Name = label
+		answers[i].Type = grabUint16(bytes, b)
+		answers[i].Class = grabUint16(bytes, b+2)
+		answers[i].Ttl = grabUint32(bytes, b+4)
+		answers[i].RdLength = grabUint16(bytes, b+8)
+		b += 10
+		answers[i].Rdata = bytes[b : b+int(answers[i].RdLength)]
+		answers[i].Rendered = getRdataHumanDisplay(answers[i].Rdata, bytes, answers[i].Type, b)
+		b += int(answers[i].RdLength)
+	}
+	return answers, b
+}
+
+func decodeAnswerSection(bytes []byte, start int, numAnswers int, label string) int {
+	answers, nextOffset := buildResourceRecords(bytes, start, numAnswers)
+
+	if numAnswers > 0 {
+		fmt.Println(label, "Section:")
+
+		for _, answer := range answers {
+			fmt.Printf("%s\t%d\t%x\t%s\t%s\n", answer.Name, answer.Ttl, answer.Class, recordIntToType(answer.Type), answer.Rendered)
+		}
+		fmt.Println("-----------------------------------------------------------------")
+	}
+
+	return nextOffset
+}
+
 func decodeDnsResponse(bytes []byte) DnsMessage {
 	// Decode the DNS response
 	// The first 12 bytes are the header
 	header := DnsHeader{
-		Id:      uint16(bytes[0])<<8 | uint16(bytes[1]),
-		Flags:   uint16(bytes[2])<<8 | uint16(bytes[3]),
-		QuCount: uint16(bytes[4])<<8 | uint16(bytes[5]),
-		AnCount: uint16(bytes[6])<<8 | uint16(bytes[7]),
-		AuCount: uint16(bytes[8])<<8 | uint16(bytes[9]),
-		AdCount: uint16(bytes[10])<<8 | uint16(bytes[11]),
+		Id:      grabUint16(bytes, 0),
+		Flags:   grabUint16(bytes, 2),
+		QuCount: grabUint16(bytes, 4),
+		AnCount: grabUint16(bytes, 6),
+		AuCount: grabUint16(bytes, 8),
+		AdCount: grabUint16(bytes, 10),
 	}
 
 	fmt.Println("-----------------------------------------------------------------")
@@ -261,8 +316,8 @@ func decodeDnsResponse(bytes []byte) DnsMessage {
 
 	question := DnsQuestion{
 		Qname:  domainName,
-		Qclass: uint16(bytes[b])<<8 | uint16(bytes[b+1]),
-		Qtype:  uint16(bytes[b+2])<<8 | uint16(bytes[b+3]),
+		Qclass: grabUint16(bytes, b),
+		Qtype:  grabUint16(bytes, b+2),
 	}
 	b += 4
 
@@ -270,28 +325,12 @@ func decodeDnsResponse(bytes []byte) DnsMessage {
 	fmt.Printf("QNAME=%s\tQCLASS=%x\tQTYPE=%x\n", question.Qname, question.Qclass, question.Qtype)
 	fmt.Println("-----------------------------------------------------------------")
 
-	answers := make([]DnsResourceRecord, header.AnCount)
-
-	for i := 0; i < int(header.AnCount); i++ {
-		label, newOffset := getLabel(b, bytes)
-		b = newOffset
-		answers[i].Name = label
-		answers[i].Type = uint16(bytes[b])<<8 | uint16(bytes[b+1])
-		answers[i].Class = uint16(bytes[b+2])<<8 | uint16(bytes[b+3])
-		answers[i].Ttl = uint32(bytes[b+4])<<24 | uint32(bytes[b+5])<<16 | uint32(bytes[b+6])<<8 | uint32(bytes[b+7])
-		answers[i].RdLength = uint16(bytes[b+8])<<8 | uint16(bytes[b+9])
-		b += 10
-		answers[i].Rdata = bytes[b : b+int(answers[i].RdLength)]
-		answers[i].Rendered = getRdataHumanDisplay(answers[i].Rdata, bytes, answers[i].Type, b)
-		b += int(answers[i].RdLength)
-	}
-
-	fmt.Println("Answer Section:")
-
-	for _, answer := range answers {
-		fmt.Printf("%s\t%d\t%x\t%s\t%s\n", answer.Name, answer.Ttl, answer.Class, recordIntToType(answer.Type), answer.Rendered)
-	}
-	fmt.Println("-----------------------------------------------------------------")
+	// Answer Section
+	b = decodeAnswerSection(bytes, b, int(header.AnCount), "Answer")
+	// Authority Section
+	b = decodeAnswerSection(bytes, b, int(header.AuCount), "Authority")
+	// Additional Section
+	decodeAnswerSection(bytes, b, int(header.AdCount), "Additional")
 
 	// Print current date and time
 	fmt.Printf("WHEN (Local):\t%s\n", time.Now().Format(time.RFC3339Nano))
